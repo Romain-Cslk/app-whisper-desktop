@@ -13,6 +13,7 @@ class SettingsStore:
     ALLOWED = {
         "theme",
         "mode",
+        "compute_device",
         "local_model",
         "api_model",
         "language",

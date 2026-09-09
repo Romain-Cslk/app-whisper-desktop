@@ -60,19 +60,28 @@ def _decode_audio(path: Path) -> tuple[np.ndarray, int]:
 
 
 def _make_diarizer(
-    segmentation_model: Path, embedding_model: Path, num_speakers: int,
+    segmentation_model: Path,
+    embedding_model: Path,
+    num_speakers: int,
     clustering_threshold: float = DEFAULT_CLUSTERING_THRESHOLD,
+    provider: str = "cpu",
 ):
+    if provider == "cuda":
+        from .compute_backend import prepare_sherpa_windows_runtime
+
+        prepare_sherpa_windows_runtime(provider)
     import sherpa_onnx
 
     config = sherpa_onnx.OfflineSpeakerDiarizationConfig(
         segmentation=sherpa_onnx.OfflineSpeakerSegmentationModelConfig(
             pyannote=sherpa_onnx.OfflineSpeakerSegmentationPyannoteModelConfig(
                 model=str(segmentation_model), window_shift_ratio=0.1
-            )
+            ),
+            num_threads=2,
+            provider=provider,
         ),
         embedding=sherpa_onnx.SpeakerEmbeddingExtractorConfig(
-            model=str(embedding_model), num_threads=2, provider="cpu"
+            model=str(embedding_model), num_threads=2, provider=provider
         ),
         clustering=sherpa_onnx.FastClusteringConfig(num_clusters=num_speakers, threshold=clustering_threshold),
         min_duration_on=0.3,
@@ -83,11 +92,15 @@ def _make_diarizer(
     return sherpa_onnx.OfflineSpeakerDiarization(config)
 
 
-def _make_extractor(embedding_model: Path):
+def _make_extractor(embedding_model: Path, provider: str = "cpu"):
+    if provider == "cuda":
+        from .compute_backend import prepare_sherpa_windows_runtime
+
+        prepare_sherpa_windows_runtime(provider)
     import sherpa_onnx
 
     config = sherpa_onnx.SpeakerEmbeddingExtractorConfig(
-        model=str(embedding_model), num_threads=2, provider="cpu"
+        model=str(embedding_model), num_threads=2, provider=provider
     )
     if not config.validate():
         raise RuntimeError("Configuration sherpa-onnx d'empreinte vocale invalide.")
@@ -206,11 +219,14 @@ def _process_one(
     embedding_model: Path,
     num_speakers: int,
     clustering_threshold: float = DEFAULT_CLUSTERING_THRESHOLD,
+    provider: str = "cpu",
 ) -> tuple[list[DiarizationTurn], list[SpeakerCluster]]:
     samples, sample_rate = _decode_audio(path)
     if samples.size == 0 or float(np.max(np.abs(samples))) < 1e-5:
         return [], []
-    diarizer = _make_diarizer(segmentation_model, embedding_model, num_speakers, clustering_threshold)
+    diarizer = _make_diarizer(
+        segmentation_model, embedding_model, num_speakers, clustering_threshold, provider
+    )
     result = diarizer.process(samples).sort_by_start_time()
     raw: list[DiarizationTurn] = []
     for item in result:
@@ -235,7 +251,7 @@ def _process_one(
         )
         for item in shifted_turns
     ]
-    extractor = _make_extractor(embedding_model)
+    extractor = _make_extractor(embedding_model, provider)
     clusters: list[SpeakerCluster] = []
     for cluster_id in sorted({item.cluster_id for item in local_turns}):
         duration = sum(item.duration for item in local_turns if item.cluster_id == cluster_id)
@@ -251,6 +267,9 @@ def process_request(payload: dict[str, Any]) -> DiarizationResult:
         payload.get("expected_speakers", 0),
         payload.get("clustering_threshold", DEFAULT_CLUSTERING_THRESHOLD),
     )
+    provider = str(payload.get("provider", "cpu") or "cpu").lower()
+    if provider not in {"cpu", "cuda"}:
+        raise ValueError("Provider de diarisation invalide.")
     if payload.get("model_set_id", MODEL_SET_ID) != MODEL_SET_ID:
         raise ValueError("Espace vocal incompatible dans la requete.")
     for key in ("microphone_offset", "system_offset"):
@@ -276,6 +295,7 @@ def process_request(payload: dict[str, Any]) -> DiarizationResult:
                 embedding_model=embedding,
                 num_speakers=1,
                 clustering_threshold=threshold,
+                provider=provider,
             )
             all_turns.extend(turns)
             all_clusters.extend(clusters)
@@ -289,6 +309,7 @@ def process_request(payload: dict[str, Any]) -> DiarizationResult:
                 embedding_model=embedding,
                 num_speakers=max(1, expected - int(bool(all_turns))) if expected else -1,
                 clustering_threshold=threshold,
+                provider=provider,
             )
             all_turns.extend(turns)
             all_clusters.extend(clusters)
@@ -302,6 +323,7 @@ def process_request(payload: dict[str, Any]) -> DiarizationResult:
             embedding_model=embedding,
             num_speakers=expected or -1,
             clustering_threshold=threshold,
+            provider=provider,
         )
         all_turns.extend(turns)
         all_clusters.extend(clusters)
@@ -314,14 +336,16 @@ def process_request(payload: dict[str, Any]) -> DiarizationResult:
     return DiarizationResult(MODEL_SET_ID, tuple(all_turns), tuple(all_clusters))
 
 
-def probe_models(segmentation_model: Path, embedding_model: Path) -> dict[str, Any]:
+def probe_models(
+    segmentation_model: Path, embedding_model: Path, provider: str = "cpu"
+) -> dict[str, Any]:
     """Load native runtimes/models and run an embedding inference.
 
     The waveform need not be speech: this is a packaging smoke test, not a
     quality benchmark. Real meeting quality is validated separately.
     """
-    _make_diarizer(segmentation_model, embedding_model, -1)
-    extractor = _make_extractor(embedding_model)
+    _make_diarizer(segmentation_model, embedding_model, -1, provider=provider)
+    extractor = _make_extractor(embedding_model, provider)
     t = np.arange(TARGET_SAMPLE_RATE * 2, dtype=np.float32) / TARGET_SAMPLE_RATE
     samples = (0.02 * np.sin(2 * np.pi * 220.0 * t)).astype(np.float32)
     value = _embedding(extractor, samples, TARGET_SAMPLE_RATE)
@@ -337,7 +361,9 @@ def worker_main(request_path: Path, response_path: Path) -> int:
         action = request.get("action", "diarize")
         if action == "probe":
             result: dict[str, Any] = probe_models(
-                Path(str(request["segmentation_model"])), Path(str(request["embedding_model"]))
+                Path(str(request["segmentation_model"])),
+                Path(str(request["embedding_model"])),
+                str(request.get("provider", "cpu") or "cpu").lower(),
             )
         elif action == "diarize":
             result = {"ok": True, "result": process_request(request).to_dict()}

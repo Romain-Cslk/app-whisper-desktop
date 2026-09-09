@@ -34,6 +34,7 @@ from ..core.config import LANGS, MODEL_APPROX_SIZE, MODELS_CLOUD, MODELS_LOCAL
 from ..core.paths import AppPaths
 from ..core.settings import SettingsStore
 from ..models.transcription import TranscriptionOptions
+from ..services.compute_backend import validate_compute_backend
 from ..services.diarization_options import (
     DEFAULT_CLUSTERING_THRESHOLD,
     MAX_EXPECTED_SPEAKERS,
@@ -167,8 +168,15 @@ class MainWindow(QMainWindow):
 
         self.tabs = QTabWidget()
         self.mode = QComboBox()
-        self.mode.addItem("Local (CPU int8)", "local")
+        self.mode.addItem("Local", "local")
         self.mode.addItem("OpenAI API", "api")
+        self.compute_device = QComboBox()
+        self.compute_device.addItem("CPU (int8)", "cpu")
+        self.compute_device.addItem("GPU NVIDIA (CUDA)", "cuda")
+        self.compute_device.setToolTip(
+            "Pilote tout le calcul local : Whisper et, si activée, la diarisation. "
+            "Le mode GPU nécessite NVIDIA CUDA 12.x, cuDNN 9 et le runtime sherpa CUDA."
+        )
         self.model = QComboBox()
         self.language = QComboBox()
         self.language.addItem("Détection automatique", None)
@@ -232,6 +240,7 @@ class MainWindow(QMainWindow):
         self.options = QGroupBox("Paramètres")
         form = QFormLayout(self.options)
         form.addRow("Mode", self.mode)
+        form.addRow("Calcul local", self.compute_device)
         form.addRow("Modèle", self.model)
         form.addRow("Langue", self.language)
         form.addRow("Sortie", self.output_type)
@@ -321,6 +330,9 @@ class MainWindow(QMainWindow):
 
     def _restore_preferences(self) -> None:
         self.mode.setCurrentIndex(max(0, self.mode.findData(self.settings.get("mode", "local"))))
+        self.compute_device.setCurrentIndex(
+            max(0, self.compute_device.findData(self.settings.get("compute_device", "cpu")))
+        )
         self._mode_changed()
         self.language.setCurrentIndex(max(0, self.language.findData(self.settings.get("language", "fr"))))
         if self.mode.currentData() == "api":
@@ -341,6 +353,7 @@ class MainWindow(QMainWindow):
 
     def _connect_settings(self) -> None:
         self.mode.currentIndexChanged.connect(self._mode_changed)
+        self.compute_device.currentIndexChanged.connect(self._save_preferences)
         self.model.currentIndexChanged.connect(self._save_preferences)
         self.language.currentIndexChanged.connect(self._save_preferences)
         self.output_type.currentIndexChanged.connect(self._save_preferences)
@@ -364,8 +377,13 @@ class MainWindow(QMainWindow):
         self.output_type.setEnabled(api)
         if not api:
             self.output_type.setCurrentIndex(0)
+        self._update_compute_device_state()
         self._update_diarization_hint()
         self._save_preferences()
+
+    def _update_compute_device_state(self) -> None:
+        local_compute_used = self.mode.currentData() == "local" or self.diarization.isChecked()
+        self.compute_device.setEnabled(local_compute_used)
 
     def _update_diarization_hint(self) -> None:
         if self.mode.currentData() == "api" and self.diarization.isChecked():
@@ -385,6 +403,7 @@ class MainWindow(QMainWindow):
         self.expected_speakers.setEnabled(enabled)
         self.clustering_threshold.setEnabled(enabled and self.expected_speakers.value() == 0)
         self.manage_speakers_button.setEnabled(True)
+        self._update_compute_device_state()
         self._update_diarization_hint()
         if save:
             self._save_preferences()
@@ -394,6 +413,7 @@ class MainWindow(QMainWindow):
             return
         values = {
             "mode": self.mode.currentData(),
+            "compute_device": self.compute_device.currentData(),
             "api_model" if self.mode.currentData() == "api" else "local_model": self.model.currentData(),
             "language": self.language.currentData(),
             "output_type": self.output_type.currentData(),
@@ -505,6 +525,7 @@ class MainWindow(QMainWindow):
             language=self.language.currentData(),
             output_type=self.output_type.currentData(),
             output_name=self.output_name.text().strip(),
+            compute_device=self.compute_device.currentData(),
             diarization_enabled=self.diarization.isChecked(),
             self_speaker_name=self.self_speaker_name.text().strip() or "Moi",
             expected_speakers=self.expected_speakers.value(),
@@ -563,7 +584,7 @@ class MainWindow(QMainWindow):
                 self._launch_failed,
             )
         else:
-            self._submit_job(options)
+            self._preflight_compute_backend(options)
 
     def _model_checked(self, options: TranscriptionOptions, available: bool) -> None:
         if self._cancel_requested or self._closing:
@@ -586,7 +607,22 @@ class MainWindow(QMainWindow):
                 self._set_active(False)
                 self.state.setText("Téléchargement non lancé")
                 return
-        self._submit_job(options)
+        self._preflight_compute_backend(options)
+
+    def _preflight_compute_backend(self, options: TranscriptionOptions) -> None:
+        uses_local_compute = options.mode == "local" or options.diarization_enabled
+        if not uses_local_compute or options.compute_device == "cpu":
+            self._submit_job(options)
+            return
+        self.state.setText("Vérification du GPU CUDA…")
+        self.runner.submit(
+            lambda: validate_compute_backend(
+                options.compute_device,
+                require_diarization=options.diarization_enabled,
+            ),
+            lambda _info: self._submit_job(options),
+            self._launch_failed,
+        )
 
     def _submit_job(self, options: TranscriptionOptions) -> None:
         if self._cancel_requested or self._closing:

@@ -41,6 +41,7 @@ class DiarizationService:
         file_index: int,
         expected_speakers: int = 0,
         clustering_threshold: float = DEFAULT_CLUSTERING_THRESHOLD,
+        compute_device: str = "cpu",
         cancel_check: Callable[[], None],
         progress: Callable[[float], None] | None = None,
         log: Callable[[str], None] | None = None,
@@ -48,6 +49,10 @@ class DiarizationService:
         expected_speakers, clustering_threshold = validate_diarization_options(
             expected_speakers, clustering_threshold
         )
+        compute_device = str(compute_device or "cpu").lower()
+        if compute_device not in {"cpu", "cuda"}:
+            raise ValueError("Périphérique de diarisation inconnu.")
+        provider = "cuda" if compute_device == "cuda" else "cpu"
         if not re.fullmatch(r"[0-9a-f]{32}", job_id) or type(file_index) is not int or file_index < 0:
             raise ValueError("Identifiant de traitement invalide.")
         cancel_check()
@@ -71,6 +76,7 @@ class DiarizationService:
             "audio_path": str(Path(source).resolve()),
             "expected_speakers": expected_speakers,
             "clustering_threshold": clustering_threshold,
+            "provider": provider,
             "segmentation_model": str(segmentation.resolve()),
             "embedding_model": str(embedding.resolve()),
         }
@@ -140,7 +146,16 @@ class DiarizationService:
             # of a document-generation job, or after a cancelled/failed worker.
             shutil.rmtree(work, ignore_errors=True)
 
-    def probe_worker(self, segmentation: Path, embedding: Path, directory: Path) -> dict[str, Any]:
+    def probe_worker(
+        self,
+        segmentation: Path,
+        embedding: Path,
+        directory: Path,
+        compute_device: str = "cpu",
+    ) -> dict[str, Any]:
+        compute_device = str(compute_device or "cpu").lower()
+        if compute_device not in {"cpu", "cuda"}:
+            raise ValueError("Périphérique de diarisation inconnu.")
         directory.mkdir(parents=True, exist_ok=True)
         request = directory / "probe-request.json"
         response = directory / "probe-response.json"
@@ -149,6 +164,7 @@ class DiarizationService:
                 {
                     "schema_version": 1,
                     "action": "probe",
+                    "provider": "cuda" if compute_device == "cuda" else "cpu",
                     "segmentation_model": str(segmentation.resolve()),
                     "embedding_model": str(embedding.resolve()),
                 }

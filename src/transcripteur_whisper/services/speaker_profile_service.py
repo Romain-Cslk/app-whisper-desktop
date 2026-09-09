@@ -17,8 +17,8 @@ from .dpapi import WindowsDpapiCodec
 from .speaker_persistence import SpeakerTransaction, atomic_bytes, speaker_lock
 
 PROFILE_SCHEMA_VERSION = 1  # Existing DPAPI profiles remain readable.
-DEFAULT_AUTO_THRESHOLD = 0.82
-DEFAULT_AUTO_MARGIN = 0.08
+DEFAULT_AUTO_THRESHOLD = 0.74
+DEFAULT_AUTO_MARGIN = 0.015
 MIN_AUTO_CLUSTER_SECONDS = 5.0
 MIN_AUTO_QUERY_EMBEDDINGS = 2
 MIN_PROFILE_EMBEDDINGS_FOR_AUTO = 2
@@ -234,44 +234,208 @@ class SpeakerProfileService:
 
     def match_cluster_for_model(
         self, cluster: SpeakerCluster, model_set_id: str, *,
-        threshold: float = DEFAULT_AUTO_THRESHOLD, margin_required: float = DEFAULT_AUTO_MARGIN,
+        threshold: float = DEFAULT_AUTO_THRESHOLD,
+        margin_required: float = DEFAULT_AUTO_MARGIN,
     ) -> SpeakerMatch:
-        def rejected(reason):
+        """Robust multi-embedding speaker identification.
+
+        The previous implementation rejected a complete identity as soon as a
+        single query embedding was noisy or closer to another profile.
+
+        This implementation:
+        - keeps every stored reference embedding;
+        - compares every query embedding to every compatible profile;
+        - tolerates one bad query embedding when at least four are available;
+        - requires a majority of query embeddings to vote for the same profile;
+        - computes ambiguity from aggregate profile scores, not from the single
+          worst per-sample margin.
+        """
+
+        def rejected(reason: str) -> SpeakerMatch:
             return SpeakerMatch(None, None, False, 0.0, 0.0, False, reason)
+
         if cluster.source == "self":
-            return SpeakerMatch(None, None, True, 1.0, 1.0, False, "microphone personnel")
+            return SpeakerMatch(
+                None,
+                None,
+                True,
+                1.0,
+                1.0,
+                False,
+                "microphone personnel",
+            )
+
         if not math.isfinite(cluster.duration) or cluster.duration < MIN_AUTO_CLUSTER_SECONDS:
-            return rejected("dur\u00e9e de parole insuffisante")
+            return rejected("duree de parole insuffisante")
+
         if len(cluster.embeddings) < MIN_AUTO_QUERY_EMBEDDINGS:
             return rejected("pas assez d'extraits vocaux propres")
-        if not (math.isfinite(threshold) and 0 <= threshold <= 1 and
-                math.isfinite(margin_required) and 0 <= margin_required <= 1):
+
+        if not (
+            math.isfinite(threshold)
+            and 0 <= threshold <= 1
+            and math.isfinite(margin_required)
+            and 0 <= margin_required <= 1
+        ):
             raise ValueError("Seuil d'identification invalide.")
+
         try:
-            query = np.asarray(_validated_vectors(cluster.embeddings), dtype=np.float32)
+            query = np.asarray(
+                _validated_vectors(cluster.embeddings),
+                dtype=np.float32,
+            )
         except (TypeError, ValueError):
-            return rejected("empreintes de requ\u00eate invalides")
-        scored = []
+            return rejected("empreintes de requete invalides")
+
+        candidates = []
+
         for profile in self.list_profiles():
-            if profile.model_set_id != model_set_id or len(profile.embeddings) < MIN_PROFILE_EMBEDDINGS_FOR_AUTO:
+            if profile.model_set_id != model_set_id:
                 continue
-            references = np.asarray(_validated_vectors(profile.embeddings), dtype=np.float32)
-            if references.shape[1] != query.shape[1]:
+
+            if len(profile.embeddings) < MIN_PROFILE_EMBEDDINGS_FOR_AUTO:
                 continue
-            # A voice variant matches a confirmed exemplar, not a global centroid.
-            similarities = np.clip(query @ references.T, -1.0, 1.0).max(axis=1)
-            scored.append((float(similarities.mean()), profile, similarities))
-        if not scored:
-            return rejected("aucun profil compatible suffisamment document\u00e9")
-        scored.sort(key=lambda item: (-item[0], item[1].profile_id))
-        score, profile, similarities = scored[0]
-        competitors = np.maximum.reduce([item[2] for item in scored[1:]]) if len(scored) > 1 else np.zeros_like(similarities)
-        margin = float(np.min(similarities - competitors))
-        # EVERY query sample must support the same person. Mixed-speaker queries,
-        # low-confidence fragments and ties remain unnamed rather than guessed.
-        accepted = bool(np.min(similarities) >= threshold and margin >= margin_required)
-        reason = "plusieurs extraits concordants" if accepted else (
-            "extraits vocaux discordants ou similarit\u00e9 insuffisante"
-            if float(np.min(similarities)) < threshold else "identit\u00e9 ambigu\u00eb entre plusieurs profils"
+
+            try:
+                references = np.asarray(
+                    _validated_vectors(profile.embeddings),
+                    dtype=np.float32,
+                )
+            except (TypeError, ValueError):
+                continue
+
+            if references.ndim != 2 or references.shape[1] != query.shape[1]:
+                continue
+
+            # For each fresh voice excerpt, retain the closest confirmed
+            # reference variant of this person.
+            per_query = np.clip(
+                query @ references.T,
+                -1.0,
+                1.0,
+            ).max(axis=1)
+
+            # Robust aggregate:
+            # with >= 4 query embeddings, one potentially noisy excerpt may
+            # not veto an otherwise coherent identification.
+            ordered = np.sort(per_query)
+
+            if len(ordered) >= 4:
+                robust_score = float(np.mean(ordered[1:]))
+            else:
+                robust_score = float(np.mean(ordered))
+
+            mean_score = float(np.mean(per_query))
+
+            candidates.append(
+                {
+                    "profile": profile,
+                    "per_query": per_query,
+                    "score": robust_score,
+                    "mean": mean_score,
+                }
+            )
+
+        if not candidates:
+            return rejected(
+                "aucun profil compatible suffisamment documente"
+            )
+
+        # Matrix: query embeddings x known profiles.
+        matrix = np.stack(
+            [candidate["per_query"] for candidate in candidates],
+            axis=1,
         )
-        return SpeakerMatch(profile.profile_id, profile.name, profile.is_self, score, margin, accepted, reason)
+
+        # Each fresh embedding votes independently for the closest profile.
+        winners = np.argmax(matrix, axis=1)
+
+        for index, candidate in enumerate(candidates):
+            candidate["votes"] = int(np.sum(winners == index))
+
+        candidates.sort(
+            key=lambda item: (
+                -item["score"],
+                -item["votes"],
+                -item["mean"],
+                item["profile"].profile_id,
+            )
+        )
+
+        best = candidates[0]
+        profile = best["profile"]
+        similarities = best["per_query"]
+        score = float(best["score"])
+
+        second_score = (
+            float(candidates[1]["score"])
+            if len(candidates) > 1
+            else 0.0
+        )
+
+        margin = score - second_score
+
+        sample_count = len(similarities)
+
+        # 2/2, 2/3, 3/4, 3/5, 4/6...
+        required_support = max(
+            2,
+            int(math.ceil(sample_count * 0.50)),
+        )
+
+        vote_count = int(best["votes"])
+
+        # Individual samples may be slightly weaker than the final aggregate,
+        # but a majority must remain credible.
+        sample_floor = max(0.0, threshold - 0.08)
+
+        quality_count = int(
+            np.sum(similarities >= sample_floor)
+        )
+
+        accepted = bool(
+            score >= threshold
+            and margin >= margin_required
+            and vote_count >= required_support
+            and quality_count >= required_support
+        )
+
+        if accepted:
+            reason = (
+                f"identification robuste: score={score:.3f}, "
+                f"marge={margin:.3f}, "
+                f"votes={vote_count}/{sample_count}, "
+                f"extraits_valides={quality_count}/{sample_count}"
+            )
+        elif score < threshold:
+            reason = (
+                f"similarite globale insuffisante: "
+                f"score={score:.3f} < {threshold:.3f}"
+            )
+        elif margin < margin_required:
+            reason = (
+                f"identite ambigue entre plusieurs profils: "
+                f"marge={margin:.3f} < {margin_required:.3f}"
+            )
+        elif vote_count < required_support:
+            reason = (
+                f"vote vocal insuffisant: "
+                f"{vote_count}/{sample_count}, "
+                f"minimum={required_support}"
+            )
+        else:
+            reason = (
+                f"pas assez d'extraits coherents: "
+                f"{quality_count}/{sample_count}, "
+                f"minimum={required_support}"
+            )
+
+        return SpeakerMatch(
+            profile.profile_id,
+            profile.name,
+            profile.is_self,
+            score,
+            margin,
+            accepted,
+            reason,
+        )

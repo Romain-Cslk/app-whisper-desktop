@@ -1,4 +1,4 @@
-"""CPU/int8 faster-whisper backend with timestamp-preserving output."""
+"""CPU/GPU faster-whisper backend with timestamp-preserving output."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -7,11 +7,44 @@ from typing import Callable
 from ..models.transcript import StructuredTranscript, TranscriptSegment, TranscriptWord
 
 
-def load_model(model_path: Path):
-    from faster_whisper import WhisperModel
+def load_model(model_path: Path, *, device: str = "cpu", compute_type: str | None = None):
+    from faster_whisper import BatchedInferencePipeline, WhisperModel
 
-    return WhisperModel(str(model_path), device="cpu", compute_type="int8", local_files_only=True)
+    if device not in {"cpu", "cuda"}:
+        raise ValueError("Périphérique Whisper inconnu.")
 
+    selected_compute = compute_type or ("float16" if device == "cuda" else "int8")
+
+    try:
+        whisper_model = WhisperModel(
+            str(model_path),
+            device=device,
+            compute_type=selected_compute,
+            local_files_only=True,
+        )
+
+        # GPU = transcription batchée
+        if device == "cuda":
+            return BatchedInferencePipeline(model=whisper_model)
+
+        # CPU = comportement historique
+        return whisper_model
+
+    except Exception as exc:
+        if device == "cuda":
+            raise RuntimeError(
+                "Impossible de charger Whisper sur le GPU CUDA. "
+                f"Détail : {exc}"
+            ) from exc
+        raise
+
+def _run_transcription(model, path: Path, **kwargs):
+    from faster_whisper import BatchedInferencePipeline
+
+    if isinstance(model, BatchedInferencePipeline):
+        kwargs["batch_size"] = 8
+
+    return model.transcribe(str(path), **kwargs)
 
 def transcribe_structured(
     model,
@@ -20,8 +53,13 @@ def transcribe_structured(
     cancel_check: Callable[[], None],
     on_segment: Callable[[float, str], None],
 ) -> StructuredTranscript:
-    segments, info = model.transcribe(
-        str(path), language=language, beam_size=5, vad_filter=True, word_timestamps=True
+    segments, info = _run_transcription(
+        model,
+        path,
+        language=language,
+        beam_size=5,
+        vad_filter=True,
+        word_timestamps=True,
     )
     duration = info.duration or 1.0
     output: list[TranscriptSegment] = []
@@ -61,7 +99,13 @@ def transcribe(
     Keeping this separate is intentional: when diarization is OFF we do not
     request word timestamps and do not alter the pre-1.1 transcription behavior.
     """
-    segments, info = model.transcribe(str(path), language=language, beam_size=5, vad_filter=True)
+    segments, info = _run_transcription(
+    model,
+    path,
+    language=language,
+    beam_size=5,
+    vad_filter=True,
+    )
     duration = info.duration or 1.0
     lines: list[str] = []
     for segment in segments:

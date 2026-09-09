@@ -8,9 +8,16 @@ dynamic = ["version"]
 description = "Transcription audio et vidéo, application Windows Qt native"
 requires-python = ">=3.11,<3.13"
 dependencies = [
+  "nvidia-curand-cu12==10.3.9.90",
+  "nvidia-cuda-nvrtc-cu12==12.8.93",
+  "nvidia-nvjitlink-cu12==12.8.93",
+  "nvidia-cufft-cu12==11.3.3.83",
+  "nvidia-cudnn-cu12==9.8.0.87",
+  "nvidia-cublas-cu12==12.8.5.5",
+  "nvidia-cuda-runtime-cu12==12.8.90",
   "PySide6==6.8.3",
-  "faster-whisper==1.0.3",
-  "ctranslate2==4.6.1",
+  "faster-whisper==1.2.1",
+  "ctranslate2==4.6.3",
   "setuptools>=68,<81",
   "backports.tarfile>=1.2,<2",
   "av==12.2.0",
@@ -18,9 +25,8 @@ dependencies = [
   "httpx==0.28.1",
   "requests>=2.32,<3",
   "onnxruntime==1.23.2",
-  "sherpa-onnx==1.13.7",
-  "sherpa-onnx-core==1.13.7",
-  "huggingface-hub==1.1.5",
+  "sherpa-onnx==1.13.7+cuda12.cudnn9",
+"huggingface-hub==1.1.5",
   "numpy==2.4.6",
   "SoundCard==0.4.6",
   "sounddevice==0.5.5",
@@ -57,3 +63,6 @@ extend-exclude = ["venv", ".venv", "build", "dist", "models", "src/transcripteur
 
 [tool.ruff.lint]
 select = ["E4", "E7", "E9", "F", "I"]
+
+[tool.uv]
+find-links = ["https://k2-fsa.github.io/sherpa/onnx/cuda.html"]

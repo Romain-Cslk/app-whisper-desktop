@@ -14,7 +14,12 @@ def main() -> int:
     parser.add_argument("--models-dir", required=True, type=Path)
     parser.add_argument("--executable", type=Path)
     parser.add_argument("--work-dir", type=Path)
+    parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     args = parser.parse_args()
+    if args.device == "cuda":
+        from transcripteur_whisper.services.compute_backend import configure_cuda_dll_search
+
+        configure_cuda_dll_search()
     models = args.models_dir.resolve()
     segmentation = models / "segmentation.onnx"
     embedding = models / "embedding.onnx"
@@ -29,6 +34,7 @@ def main() -> int:
             {
                 "schema_version": 1,
                 "action": "probe",
+                "provider": "cuda" if args.device == "cuda" else "cpu",
                 "segmentation_model": str(segmentation),
                 "embedding_model": str(embedding),
             }

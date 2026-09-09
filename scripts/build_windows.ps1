@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param([string]$IsccPath = "", [switch]$RequireInstaller)
+param([string]$IsccPath = "", [switch]$RequireInstaller, [switch]$EnableCuda)
 
 $ErrorActionPreference = 'Stop'
 $projectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
@@ -33,6 +33,14 @@ if (-not (Test-Path -LiteralPath $uv)) {
 Invoke-Checked $uv @('sync', '--locked', '--group', 'dev', '--group', 'build', '--python', '3.11')
 $python = Join-Path $projectRoot '.venv\Scripts\python.exe'
 Invoke-Checked $python @('-c', 'import sys; assert sys.maxsize>2**32; assert sys.version_info[:2]==(3,11)')
+if ($EnableCuda) {
+    Invoke-Checked 'powershell' @(
+        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
+        (Join-Path $projectRoot 'scripts\install_cuda_runtime.ps1'),
+        '-ProjectRoot', $projectRoot
+    )
+}
+$diarizationDevice = if ($EnableCuda) { 'cuda' } else { 'cpu' }
 Invoke-Checked $python @('-m', 'ruff', 'check', '.')
 
 $previousQt = $env:QT_QPA_PLATFORM
@@ -56,6 +64,7 @@ try {
     Invoke-Checked $python @(
         'scripts/validate_diarization.py',
         '--models-dir', $diarizationAssets,
+        '--device', $diarizationDevice,
         '--work-dir', (Join-Path $projectRoot 'build\diarization-source-smoke')
     )
 
@@ -91,6 +100,7 @@ try {
     Invoke-Checked $python @(
         'scripts/validate_diarization.py',
         '--models-dir', $bundleDiarizationModels,
+        '--device', $diarizationDevice,
         '--executable', $executable,
         '--work-dir', (Join-Path $projectRoot 'build\diarization-bundle-smoke')
     )

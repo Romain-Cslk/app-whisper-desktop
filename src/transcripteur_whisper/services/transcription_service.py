@@ -10,6 +10,7 @@ from ..integrations import openai_service, whisper_local
 from ..models.jobs import JobCancelled, ProgressReporter
 from ..models.transcript import StructuredTranscript
 from ..models.transcription import TranscriptionOptions
+from .compute_backend import validate_compute_backend
 from .diarization_service import DiarizationService
 from .document_service import generate_document
 from .files import output_filename, write_text_atomic
@@ -38,7 +39,20 @@ class TranscriptionService:
     ) -> None:
         model = None
         client = None
+        backend = None
         try:
+            uses_local_compute = not options.use_api or options.diarization_enabled
+            if uses_local_compute:
+                backend = validate_compute_backend(
+                    options.compute_device,
+                    require_diarization=options.diarization_enabled,
+                )
+                if backend.device == "cuda":
+                    reporter.log(
+                        f"Calcul local : GPU CUDA ({backend.whisper_compute_type} pour Whisper)."
+                    )
+                else:
+                    reporter.log("Calcul local : CPU int8.")
             if not options.use_api:
                 model_path = self.models.download(
                     options.model,
@@ -47,8 +61,20 @@ class TranscriptionService:
                     reporter.log,
                 )
                 reporter.cancel_check()
-                reporter.log("Chargement du modèle local (CPU int8)…")
-                model = whisper_local.load_model(model_path)
+                compute_type = backend.whisper_compute_type if backend is not None else "int8"
+                reporter.log(
+                    "Chargement du modèle local "
+                    + (
+                        f"(GPU CUDA {compute_type})…"
+                        if options.compute_device == "cuda"
+                        else "(CPU int8)…"
+                    )
+                )
+                model = whisper_local.load_model(
+                    model_path,
+                    device=options.compute_device,
+                    compute_type=compute_type,
+                )
             # Existing OpenAI client remains the document-generation client. The
             # diarized transcription endpoint uses isolated direct HTTP code so
             # it does not require a risky SDK upgrade.
@@ -206,6 +232,7 @@ class TranscriptionService:
                     file_index=index,
                     expected_speakers=options.expected_speakers,
                     clustering_threshold=options.clustering_threshold,
+                    compute_device=options.compute_device,
                     cancel_check=reporter.cancel_check,
                     progress=diarization_progress,
                     log=reporter.log,

@@ -15,6 +15,7 @@ class TranscriptionOptions:
     language: str | None = "fr"
     output_type: str = "transcription"
     output_name: str = ""
+    compute_device: str = "cpu"
     diarization_enabled: bool = False
     self_speaker_name: str = "Moi"
     expected_speakers: int = 0
@@ -31,6 +32,8 @@ class TranscriptionOptions:
             raise ValidationError(str(exc)) from exc
         if self.mode not in {"local", "api", "openai"}:
             raise ValidationError("Mode de transcription inconnu.")
+        if self.compute_device not in {"cpu", "cuda"}:
+            raise ValidationError("Calcul local : choisissez CPU ou GPU NVIDIA CUDA.")
         choices = MODELS_CLOUD if self.use_api else MODELS_LOCAL.values()
         if self.model not in choices:
             raise ValidationError("Modèle de transcription inconnu.")

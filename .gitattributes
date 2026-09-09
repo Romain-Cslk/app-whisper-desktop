@@ -1,0 +1,4 @@
+*.onnx filter=lfs diff=lfs merge=lfs -text
+*.bin filter=lfs diff=lfs merge=lfs -text
+*.exe filter=lfs diff=lfs merge=lfs -text
+models/models--Systran--faster-whisper-small/blobs/* filter=lfs diff=lfs merge=lfs -text

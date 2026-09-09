@@ -1,0 +1,13 @@
+{
+  "status": "passed",
+  "utc": "2026-09-07T14:03:28.389771+00:00",
+  "python": "3.11.9 (tags/v3.11.9:de54cf5, Apr  2 2024, 10:12:12) [MSC v.1938 64 bit (AMD64)]",
+  "duration_seconds": 16.66,
+  "input": "Windows System.Speech synthetic speech; no microphone",
+  "backend": "faster-whisper small / CPU int8 / VAD Silero / beam_size 5",
+  "network_downloads": 0,
+  "transcript": "Bonjour. Ceci est un test de transcription locale. La réunion est prévue demain à 10h. Le projet fonctionne sans connexion internet.",
+  "cache_available_after_restart": true,
+  "cache_reused_without_download": true,
+  "persistent_export_verified": true
+}

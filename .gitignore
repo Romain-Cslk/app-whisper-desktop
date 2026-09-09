@@ -1,0 +1,38 @@
+# Environnements virtuels et caches Python
+.venv*/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Éditeurs
+.vscode/
+.idea/
+
+# Logs et données de travail
+*.log
+app.log.*
+tmp/
+uploads/
+transcriptions/
+job_markers/
+
+# Modèles téléchargés et caches
+models/models--*/
+
+# Build / distribution
+build/
+dist/
+*.egg-info/
+.ruff_cache/
+*.bak
+
+# Exécutables embarqués optionnels
+ffmpeg.exe
+ffprobe.exe
+
+# Divers
+*.rc
+
+# Local model weights; never commit recordings or voice profiles.
+/src/transcripteur_whisper/assets/diarization/

@@ -1,0 +1,3 @@
+# Compatibility entry point. Use uv sync --locked --group dev --group build
+# for the reproducible environment defined in pyproject.toml and uv.lock.
+-e .

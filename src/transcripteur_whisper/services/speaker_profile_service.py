@@ -14,6 +14,7 @@ import numpy as np
 
 from ..models.speaker import SpeakerCluster, SpeakerMatch, SpeakerProfile
 from .dpapi import WindowsDpapiCodec
+from .speaker_evidence import SpeakerEvidenceStore
 from .speaker_persistence import SpeakerTransaction, atomic_bytes, speaker_lock
 
 PROFILE_SCHEMA_VERSION = 1  # Existing DPAPI profiles remain readable.
@@ -69,19 +70,10 @@ def _topk_reference_score(
     *,
     sparse_modes: bool = False,
 ) -> np.ndarray:
-    """Return one score per query without letting a large bank win by chance.
-
-    Dense profiles require repeated support from several nearby references. Sparse profiles
-    are different: a few explicitly confirmed embeddings may represent genuinely distinct
-    acoustic modes. During matching only, those sparse references are treated as individual
-    prototypes so a legitimate mode is not diluted by unrelated modes from the same person.
-    Enrollment validation never uses this sparse-mode shortcut.
-    """
+    """Return one score per query without letting a large bank win by chance."""
     similarities = np.clip(query @ references.T, -1.0, 1.0)
-
     if sparse_modes and references.shape[0] < PROFILE_TRUST_MIN_EMBEDDINGS:
         return similarities.max(axis=1)
-
     take = min(max(1, int(k)), references.shape[0])
     if take == references.shape[0]:
         return similarities.mean(axis=1)
@@ -90,12 +82,7 @@ def _topk_reference_score(
 
 
 def _trusted_reference_bank(vectors: list[tuple[float, ...]]) -> list[tuple[float, ...]]:
-    """Ignore isolated legacy samples at match time without deleting stored biometric data.
-
-    Dense profiles may already contain a few wrong or acoustically broken samples. We keep
-    all stored vectors intact, but automatic recognition uses the 80% with the strongest
-    local support inside that profile. Sparse profiles are left untouched.
-    """
+    """Ignore isolated samples at match time without deleting stored biometric data."""
     if len(vectors) < PROFILE_TRUST_MIN_EMBEDDINGS:
         return vectors
     matrix = np.asarray(vectors, dtype=np.float32)
@@ -111,12 +98,7 @@ def _trusted_reference_bank(vectors: list[tuple[float, ...]]) -> list[tuple[floa
 
 
 def _diverse_bank(vectors: list[tuple[float, ...]], limit: int = MAX_PROFILE_EMBEDDINGS):
-    """Bound storage while preserving legitimate acoustic variation.
-
-    Matching no longer trusts every stored vector equally: _trusted_reference_bank filters
-    isolated samples before identification. Storage therefore remains backwards-compatible
-    and keeps confirmed variation until the hard capacity is reached.
-    """
+    """Bound storage while preserving legitimate acoustic variation."""
     if len(vectors) <= limit:
         return vectors
     matrix = np.asarray(vectors, dtype=np.float32)
@@ -165,6 +147,7 @@ class SpeakerProfileService:
         self.path = self.directory / "profiles.v1.dpapi"
         self.codec = codec if codec is not None else WindowsDpapiCodec()
         self.transaction = SpeakerTransaction(self.directory, paths.results)
+        self.evidence = SpeakerEvidenceStore(paths, codec=self.codec)
         self.transaction.recover()
 
     @staticmethod
@@ -220,12 +203,9 @@ class SpeakerProfileService:
         return tuple(sorted(profiles, key=lambda item: item.name.casefold()))
 
     def prepare_enrollments(self, requests: Iterable[dict[str, Any]]) -> tuple[bytes, tuple[SpeakerProfile, ...]]:
-        """Validate/encrypt the ENTIRE batch without changing any persistent file.
-
-        Caller must hold speaker_lock until its transaction commits these bytes.
-        """
         payload = deepcopy(self._load_payload())
         enrolled = []
+        strict = self.evidence.strict_active()
         for request in requests:
             name = self.validate_name(request["name"])
             model = str(request["model_set_id"])
@@ -244,7 +224,10 @@ class SpeakerProfileService:
                 current = _validated_vectors(existing["embeddings"])
                 if len(current[0]) != len(incoming[0]):
                     raise ValueError("Dimension incompatible avec le profil vocal existant.")
-                _validate_enrollment_against_existing(name, current, incoming)
+                guard_bank = self.evidence.eligible_vectors(existing["profile_id"], current) if strict else current
+                # Once strict verification is enabled, unverifiable legacy vectors must not
+                # veto enrollment. Only replayable, eligible references can guard it.
+                _validate_enrollment_against_existing(name, guard_bank, incoming)
                 bank = _diverse_bank(current + incoming)
                 existing.update(
                     name=name, is_self=bool(request.get("is_self") or existing.get("is_self")),
@@ -298,7 +281,9 @@ class SpeakerProfileService:
     def delete_all(self) -> None:
         with speaker_lock(self.directory):
             self.transaction.recover()
-            updates = {self.path: None}
+            updates = {self.path: None, self.evidence.path: None}
+            for path in self.evidence.audio_root.rglob("*.wav.dpapi") if self.evidence.audio_root.is_dir() else ():
+                updates[path] = None
             for candidate in (self.directory / "pending").glob("*.dpapi"):
                 try:
                     payload = json.loads(self.codec.unprotect(candidate.read_bytes()).decode("utf-8"))
@@ -321,32 +306,19 @@ class SpeakerProfileService:
         threshold: float = DEFAULT_AUTO_THRESHOLD,
         margin_required: float = DEFAULT_AUTO_MARGIN,
     ) -> SpeakerMatch:
-        """Conservative multi-embedding identification designed to minimize false names.
-
-        A wrong automatic name is more damaging than leaving a cluster as Intervenant N.
-        Recognition therefore requires repeated support from several query samples, a clear
-        lead over competing profiles, and multiple agreeing references inside each dense profile.
-        Sparse confirmed profiles preserve their individual acoustic modes as prototypes.
-        """
-
         def rejected(reason: str, *, name: str | None = None, profile_id: str | None = None,
                      is_self: bool = False, score: float = 0.0, margin: float = 0.0) -> SpeakerMatch:
             return SpeakerMatch(profile_id, name, is_self, score, margin, False, reason)
 
         if cluster.source == "self":
             return SpeakerMatch(None, None, True, 1.0, 1.0, False, "microphone personnel")
-
         if not math.isfinite(cluster.duration) or cluster.duration < MIN_AUTO_CLUSTER_SECONDS:
             return rejected("durée de parole insuffisante")
-
         if len(cluster.embeddings) < MIN_AUTO_QUERY_EMBEDDINGS:
             return rejected("pas assez d'extraits vocaux propres")
-
         if not (
-            math.isfinite(threshold)
-            and 0 <= threshold <= 1
-            and math.isfinite(margin_required)
-            and 0 <= margin_required <= 1
+            math.isfinite(threshold) and 0 <= threshold <= 1
+            and math.isfinite(margin_required) and 0 <= margin_required <= 1
         ):
             raise ValueError("Seuil d'identification invalide.")
 
@@ -355,14 +327,17 @@ class SpeakerProfileService:
         except (TypeError, ValueError):
             return rejected("empreintes de requête invalides")
 
+        strict = self.evidence.strict_active()
         candidates = []
         for profile in self.list_profiles():
             if profile.model_set_id != model_set_id:
                 continue
-            if len(profile.embeddings) < MIN_PROFILE_EMBEDDINGS_FOR_AUTO:
-                continue
             try:
                 stored = _validated_vectors(profile.embeddings)
+                if strict:
+                    stored = self.evidence.eligible_vectors(profile.profile_id, stored)
+                if len(stored) < MIN_PROFILE_EMBEDDINGS_FOR_AUTO:
+                    continue
                 trusted = _trusted_reference_bank(stored)
                 references = np.asarray(trusted, dtype=np.float32)
             except (TypeError, ValueError):
@@ -372,10 +347,7 @@ class SpeakerProfileService:
 
             per_query = _topk_reference_score(query, references, sparse_modes=True)
             ordered = np.sort(per_query)
-            if len(ordered) >= 5:
-                robust_score = float(np.mean(ordered[1:]))
-            else:
-                robust_score = float(np.mean(ordered))
+            robust_score = float(np.mean(ordered[1:])) if len(ordered) >= 5 else float(np.mean(ordered))
             candidates.append({
                 "profile": profile,
                 "per_query": per_query,
@@ -385,13 +357,15 @@ class SpeakerProfileService:
             })
 
         if not candidates:
-            return rejected("aucun profil compatible suffisamment documenté")
+            return rejected(
+                "aucun profil vérifiable suffisamment documenté" if strict
+                else "aucun profil compatible suffisamment documenté"
+            )
 
         matrix = np.stack([candidate["per_query"] for candidate in candidates], axis=1)
         winners = np.argmax(matrix, axis=1)
         for index, candidate in enumerate(candidates):
             candidate["votes"] = int(np.sum(winners == index))
-
         candidates.sort(key=lambda item: (
             -item["score"], -item["votes"], -item["mean"], item["profile"].profile_id
         ))
@@ -409,42 +383,25 @@ class SpeakerProfileService:
         quality_count = int(np.sum(similarities >= sample_floor))
 
         accepted = bool(
-            score >= threshold
-            and margin >= margin_required
-            and vote_count >= required_support
-            and quality_count >= required_support
+            score >= threshold and margin >= margin_required
+            and vote_count >= required_support and quality_count >= required_support
         )
-
         if accepted:
             reason = (
                 f"identification prudente: score={score:.3f}, marge={margin:.3f}, "
                 f"votes={vote_count}/{sample_count}, extraits_valides={quality_count}/{sample_count}, "
                 f"references_fiables={best['trusted_references']}"
             )
-        elif score < threshold:
+            return SpeakerMatch(profile.profile_id, profile.name, profile.is_self, score, margin, True, reason)
+        if score < threshold:
             reason = f"similarité globale insuffisante: score={score:.3f} < {threshold:.3f}"
         elif margin < margin_required:
-            reason = (
-                f"identité ambiguë entre plusieurs profils: marge={margin:.3f} < {margin_required:.3f}"
-            )
+            reason = f"identité ambiguë entre plusieurs profils: marge={margin:.3f} < {margin_required:.3f}"
         elif vote_count < required_support:
-            reason = (
-                f"accord insuffisant entre extraits: {vote_count}/{sample_count}, minimum={required_support}"
-            )
+            reason = f"accord insuffisant entre extraits: {vote_count}/{sample_count}, minimum={required_support}"
         else:
-            reason = (
-                f"pas assez d'extraits cohérents: {quality_count}/{sample_count}, minimum={required_support}"
-            )
-
-        if accepted:
-            return SpeakerMatch(
-                profile.profile_id, profile.name, profile.is_self, score, margin, True, reason
-            )
+            reason = f"pas assez d'extraits cohérents: {quality_count}/{sample_count}, minimum={required_support}"
         return rejected(
-            reason,
-            name=profile.name,
-            profile_id=profile.profile_id,
-            is_self=profile.is_self,
-            score=score,
-            margin=margin,
+            reason, name=profile.name, profile_id=profile.profile_id,
+            is_self=profile.is_self, score=score, margin=margin,
         )

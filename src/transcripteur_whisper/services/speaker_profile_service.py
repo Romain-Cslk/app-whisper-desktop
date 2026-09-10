@@ -62,14 +62,26 @@ def _validated_vectors(embeddings: Iterable[Iterable[float]]) -> list[tuple[floa
     return vectors
 
 
-def _topk_reference_score(query: np.ndarray, references: np.ndarray, k: int = AUTO_REFERENCE_TOP_K) -> np.ndarray:
-    """Return one score per query using several close references, never a single lucky maximum.
+def _topk_reference_score(
+    query: np.ndarray,
+    references: np.ndarray,
+    k: int = AUTO_REFERENCE_TOP_K,
+    *,
+    sparse_modes: bool = False,
+) -> np.ndarray:
+    """Return one score per query without letting a large bank win by chance.
 
-    Taking the maximum over a large profile bank biases identification towards profiles
-    containing many embeddings and lets one contaminated reference dominate. Averaging
-    the nearest few references makes the score depend on repeated support instead.
+    Dense profiles require repeated support from several nearby references. Sparse profiles
+    are different: a few explicitly confirmed embeddings may represent genuinely distinct
+    acoustic modes. During matching only, those sparse references are treated as individual
+    prototypes so a legitimate mode is not diluted by unrelated modes from the same person.
+    Enrollment validation never uses this sparse-mode shortcut.
     """
     similarities = np.clip(query @ references.T, -1.0, 1.0)
+
+    if sparse_modes and references.shape[0] < PROFILE_TRUST_MIN_EMBEDDINGS:
+        return similarities.max(axis=1)
+
     take = min(max(1, int(k)), references.shape[0])
     if take == references.shape[0]:
         return similarities.mean(axis=1)
@@ -313,7 +325,8 @@ class SpeakerProfileService:
 
         A wrong automatic name is more damaging than leaving a cluster as Intervenant N.
         Recognition therefore requires repeated support from several query samples, a clear
-        lead over competing profiles, and multiple agreeing references inside each profile.
+        lead over competing profiles, and multiple agreeing references inside each dense profile.
+        Sparse confirmed profiles preserve their individual acoustic modes as prototypes.
         """
 
         def rejected(reason: str, *, name: str | None = None, profile_id: str | None = None,
@@ -357,7 +370,7 @@ class SpeakerProfileService:
             if references.ndim != 2 or references.shape[1] != query.shape[1]:
                 continue
 
-            per_query = _topk_reference_score(query, references)
+            per_query = _topk_reference_score(query, references, sparse_modes=True)
             ordered = np.sort(per_query)
             if len(ordered) >= 5:
                 robust_score = float(np.mean(ordered[1:]))

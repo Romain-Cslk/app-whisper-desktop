@@ -1,4 +1,4 @@
-"""Qt application entry point, isolated diarization worker and executable smoke validation."""
+"""Qt application entry point, isolated workers and executable smoke validation."""
 
 from __future__ import annotations
 
@@ -27,15 +27,26 @@ def main(argv: list[str] | None = None) -> int:
         metavar=("REQUEST_JSON", "RESPONSE_JSON"),
         help=argparse.SUPPRESS,
     )
+    parser.add_argument(
+        "--speaker-sample-worker",
+        nargs=2,
+        metavar=("REQUEST_JSON", "RESPONSE_JSON"),
+        help=argparse.SUPPRESS,
+    )
     args = parser.parse_args(argv)
     os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 
-    # IMPORTANT: execute the diarization worker before importing Qt, faster-whisper
+    # IMPORTANT: execute native inference workers before importing Qt, faster-whisper
     # or the app services. sherpa-onnx therefore gets a clean native-runtime process.
     if args.diarization_worker:
         from transcripteur_whisper.services.diarization_worker import worker_main
 
         request, response = (Path(value) for value in args.diarization_worker)
+        return worker_main(request, response)
+    if args.speaker_sample_worker:
+        from transcripteur_whisper.services.speaker_sample_worker import worker_main
+
+        request, response = (Path(value) for value in args.speaker_sample_worker)
         return worker_main(request, response)
 
     if args.smoke_test and not args.smoke_visible:

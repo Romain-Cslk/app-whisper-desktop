@@ -6,7 +6,7 @@ What it does:
 - reconstructs recoverable historical audio evidence using the manual-review tool;
 - imports existing human GOOD/BAD/UNSURE decisions when present;
 - stores each recoverable verification clip encrypted with Windows DPAPI;
-- enables strict matching so quarantined/BAD/UNSURE vectors no longer identify people.
+- enables strict matching so only human-approved GOOD vectors can identify people.
 
 No profile vector is deleted. A timestamped backup of the evidence sidecar is created
 before activation when one already exists.
@@ -153,8 +153,8 @@ def main() -> int:
         )
 
     print("\nMode strict ACTIVE.")
-    print("- GOOD et UNVERIFIED avec audio chiffre sont eligibles au matching.")
-    print("- BAD, UNSURE et QUARANTINED sont exclus du matching automatique.")
+    print("- seules les empreintes GOOD avec audio chiffre sont eligibles au matching.")
+    print("- UNVERIFIED, BAD, UNSURE et QUARANTINED sont exclus du matching automatique.")
     print("- aucune empreinte n'a ete supprimee du profil source.")
     print(f"- preuves audio chiffrees : {evidence.audio_root}")
     return 0

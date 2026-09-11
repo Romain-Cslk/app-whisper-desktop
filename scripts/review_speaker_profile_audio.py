@@ -371,7 +371,6 @@ def run_ui(paths: AppPaths, profile: Any, rows: list[ReviewRow], all_profile_nam
         QLabel,
         QLineEdit,
         QMainWindow,
-        QMessageBox,
         QPushButton,
         QTableWidget,
         QTableWidgetItem,
@@ -400,7 +399,7 @@ def run_ui(paths: AppPaths, profile: Any, rows: list[ReviewRow], all_profile_nam
             intro = QLabel(
                 f"Profil : {profile.name} - {len(rows)} empreinte(s). "
                 "Ecoutez puis classez chaque empreinte vous-meme. "
-                "Aucune empreinte n'est supprimee par cet outil."
+                "Les empreintes sans audio restent visibles uniquement via les filtres d'archive."
             )
             intro.setWordWrap(True)
             layout.addWidget(intro)
@@ -409,9 +408,10 @@ def run_ui(paths: AppPaths, profile: Any, rows: list[ReviewRow], all_profile_nam
             controls.addWidget(QLabel("Filtre :"))
             self.filter = QComboBox()
             self.filter.addItems([
-                "Tous",
-                "Problematiques d'abord",
-                "Non verifies",
+                "Audio disponible",
+                "Audio disponible - non verifies",
+                "Problematiques avec audio d'abord",
+                "Tous (archives incluses)",
                 "Critiques",
                 "Suspectes / ambigues",
                 "OK auto",
@@ -457,7 +457,7 @@ def run_ui(paths: AppPaths, profile: Any, rows: list[ReviewRow], all_profile_nam
             layout.addLayout(actions)
 
             correction = QHBoxLayout()
-            correction.addWidget(QLabel("Si mauvaise voix, vraie personne :"))
+            correction.addWidget(QLabel("Vraie personne (facultatif si mauvaise voix) :"))
             self.actual = QComboBox()
             self.actual.setEditable(True)
             self.actual.addItem("")
@@ -494,16 +494,24 @@ def run_ui(paths: AppPaths, profile: Any, rows: list[ReviewRow], all_profile_nam
         def _filtered(self) -> list[ReviewRow]:
             mode = self.filter.currentText()
             candidates = list(rows)
-            if mode == "Problematiques d'abord":
-                return sorted(candidates, key=self._priority)
-            if mode == "Non verifies":
-                return [item for item in candidates if not item.decision]
+            if mode == "Audio disponible":
+                return [item for item in candidates if item.candidate is not None]
+            if mode == "Audio disponible - non verifies":
+                return [item for item in candidates if item.candidate is not None and not item.decision]
+            if mode == "Problematiques avec audio d'abord":
+                playable = [item for item in candidates if item.candidate is not None]
+                return sorted(playable, key=self._priority)
+            if mode == "Tous (archives incluses)":
+                return candidates
             if mode == "Critiques":
-                return [item for item in candidates if item.audit_status == "FOREIGN_STRONG"]
+                return [item for item in candidates if item.candidate is not None and item.audit_status == "FOREIGN_STRONG"]
             if mode == "Suspectes / ambigues":
-                return [item for item in candidates if item.audit_status in {"FOREIGN_LIKELY", "AMBIGUOUS"}]
+                return [
+                    item for item in candidates
+                    if item.candidate is not None and item.audit_status in {"FOREIGN_LIKELY", "AMBIGUOUS"}
+                ]
             if mode == "OK auto":
-                return [item for item in candidates if item.audit_status == "TRUSTED"]
+                return [item for item in candidates if item.candidate is not None and item.audit_status == "TRUSTED"]
             if mode == "Sans audio retrouve":
                 return [item for item in candidates if item.candidate is None]
             return candidates
@@ -538,6 +546,8 @@ def run_ui(paths: AppPaths, profile: Any, rows: list[ReviewRow], all_profile_nam
             self.table.horizontalHeader().setStretchLastSection(True)
             if self.visible_rows:
                 self.table.selectRow(min(select_row, len(self.visible_rows) - 1))
+            else:
+                self._selection_changed()
             self._summary()
 
         def current_row(self) -> ReviewRow | None:
@@ -551,11 +561,19 @@ def run_ui(paths: AppPaths, profile: Any, rows: list[ReviewRow], all_profile_nam
 
         def _selection_changed(self) -> None:
             item = self.current_row()
+            playable = bool(item and item.candidate is not None)
+            self.play.setEnabled(playable)
+            self.good.setEnabled(playable)
+            self.bad.setEnabled(playable)
+            self.unsure.setEnabled(playable)
+            self.actual.setEnabled(playable)
+            self.note.setEnabled(playable)
             if item is None:
+                self.actual.setCurrentText("")
+                self.note.clear()
                 return
             self.actual.setCurrentText(item.actual_name)
             self.note.setText(item.note)
-            self.play.setEnabled(item.candidate is not None)
 
         def _play(self) -> None:
             item = self.current_row()
@@ -566,7 +584,8 @@ def run_ui(paths: AppPaths, profile: Any, rows: list[ReviewRow], all_profile_nam
 
         def _decide(self, decision: str) -> None:
             item = self.current_row()
-            if item is None:
+            if item is None or item.candidate is None:
+                self._set_status("Impossible de classer une empreinte sans audio verifiable.")
                 return
             actual_name = self.actual.currentText().strip()
             note = self.note.text().strip()
@@ -585,7 +604,7 @@ def run_ui(paths: AppPaths, profile: Any, rows: list[ReviewRow], all_profile_nam
                 "note": note,
                 "updated_at": datetime.now(timezone.utc).isoformat(),
                 "audit_status": item.audit_status,
-                "linked_audio": bool(item.candidate),
+                "linked_audio": True,
                 "link_similarity": item.link_similarity,
             }
             save_decisions(decisions_path, payload)
@@ -598,13 +617,18 @@ def run_ui(paths: AppPaths, profile: Any, rows: list[ReviewRow], all_profile_nam
         def _summary(self) -> None:
             counts = {"GOOD": 0, "BAD": 0, "UNSURE": 0, "": 0}
             playable = 0
+            playable_todo = 0
             for item in rows:
                 counts[item.decision if item.decision in counts else ""] += 1
-                playable += int(item.candidate is not None)
+                if item.candidate is not None:
+                    playable += 1
+                    if not item.decision:
+                        playable_todo += 1
             self._set_status(
                 f"Audio retrouve : {playable}/{len(rows)} | "
+                f"A verifier avec audio : {playable_todo} | "
                 f"Bonnes : {counts['GOOD']} | Mauvaises : {counts['BAD']} | "
-                f"Incertaines : {counts['UNSURE']} | A faire : {counts['']} | "
+                f"Incertaines : {counts['UNSURE']} | "
                 f"Decisions : {decisions_path}"
             )
 

@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import shutil
+import sys
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -28,11 +29,19 @@ from transcripteur_whisper.services.speaker_profile_service import SpeakerProfil
 
 def load_review_tool(repo: Path):
     path = repo / "scripts" / "review_speaker_profile_audio.py"
-    spec = importlib.util.spec_from_file_location("speaker_audio_review_tool", path)
+    module_name = "speaker_audio_review_tool"
+    spec = importlib.util.spec_from_file_location(module_name, path)
     if spec is None or spec.loader is None:
         raise RuntimeError("Impossible de charger l'outil de revue audio.")
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    # dataclasses resolves postponed annotations through sys.modules while the module
+    # is being executed. Register it before exec_module(), exactly like a normal import.
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(module_name, None)
+        raise
     return module
 
 

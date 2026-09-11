@@ -1,9 +1,13 @@
-"""Verifiable local evidence for stored speaker embeddings.
+"""Verifiable local evidence for speaker identities.
 
-Profiles keep their biometric vectors in the existing DPAPI store. This sidecar binds a
-stable fingerprint of each vector to a human-review status and, when available, an encrypted
-WAV excerpt that can be replayed later. In strict mode, only human-approved GOOD embeddings
-with replayable audio are allowed to participate in automatic identity matching.
+The legacy profile store remains readable and untouched. This encrypted sidecar binds a
+stable fingerprint of each embedding to its human-review status and, when available, a
+replayable WAV excerpt. In strict mode the sidecar is authoritative: only human-approved
+GOOD embeddings with replayable audio may participate in automatic identity matching.
+
+Because the embedding itself is stored in the DPAPI-protected sidecar, a clip manually
+identified as another known person can become GOOD evidence for that target profile without
+mutating or reordering the legacy profile vector bank.
 """
 from __future__ import annotations
 
@@ -34,7 +38,7 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def embedding_key(vector: Iterable[float]) -> str:
+def _normalised_tuple(vector: Iterable[float]) -> tuple[float, ...]:
     value = np.asarray(tuple(vector), dtype=np.float32)
     if value.ndim != 1 or value.size < 16 or not np.isfinite(value).all():
         raise ValueError("Empreinte vocale invalide.")
@@ -42,7 +46,12 @@ def embedding_key(vector: Iterable[float]) -> str:
     if not math.isfinite(norm) or norm <= 1e-8:
         raise ValueError("Empreinte vocale vide.")
     value = np.ascontiguousarray(value / norm, dtype=np.float32)
-    return hashlib.sha256(value.tobytes()).hexdigest()
+    return tuple(float(item) for item in value)
+
+
+def embedding_key(vector: Iterable[float]) -> str:
+    value = np.asarray(_normalised_tuple(vector), dtype=np.float32)
+    return hashlib.sha256(np.ascontiguousarray(value).tobytes()).hexdigest()
 
 
 def _wav_bytes(samples: np.ndarray, sample_rate: int) -> bytes:
@@ -129,28 +138,76 @@ class SpeakerEvidenceStore:
         record = records.get(key)
         return record if isinstance(record, dict) else None
 
+    def _good_vectors_from_payload(
+        self, payload: dict[str, Any], profile_id: str,
+    ) -> list[tuple[float, ...]]:
+        profile = payload.get("profiles", {}).get(profile_id)
+        if not isinstance(profile, dict):
+            return []
+        records = profile.get("embeddings")
+        if not isinstance(records, dict):
+            return []
+
+        output: list[tuple[float, ...]] = []
+        seen: set[str] = set()
+        for key, record in records.items():
+            if not isinstance(record, dict) or record.get("status") not in MATCHABLE_STATUSES:
+                continue
+            try:
+                audio = self._audio_path(profile_id, str(key))
+            except ValueError:
+                continue
+            if not audio.is_file():
+                continue
+            stored_embedding = record.get("embedding")
+            if stored_embedding is None:
+                continue
+            try:
+                vector = _normalised_tuple(stored_embedding)
+                stable_key = embedding_key(vector)
+            except (TypeError, ValueError):
+                continue
+            if stable_key != key or stable_key in seen:
+                continue
+            seen.add(stable_key)
+            output.append(vector)
+        return output
+
     def eligible_vectors(
         self, profile_id: str, vectors: Iterable[Iterable[float]],
     ) -> list[tuple[float, ...]]:
-        values = [tuple(float(x) for x in vector) for vector in vectors]
+        """Return the references allowed to identify this profile.
+
+        Before strict mode, preserve legacy behaviour and return the supplied profile bank.
+        In strict mode, the encrypted evidence sidecar is authoritative and may contain
+        human-reassigned GOOD embeddings that never existed in the legacy target profile.
+        """
+        legacy = [tuple(float(x) for x in vector) for vector in vectors]
         with speaker_lock(self.speakers):
             self.transaction.recover()
             payload = self._load_payload()
             if not payload.get("strict_verification"):
-                return values
-            output: list[tuple[float, ...]] = []
-            for vector in values:
-                key = embedding_key(vector)
-                record = self._record_for(payload, profile_id, key)
-                if not record or record.get("status") not in MATCHABLE_STATUSES:
-                    continue
-                try:
-                    audio = self._audio_path(profile_id, key)
-                except ValueError:
-                    continue
-                if audio.is_file():
-                    output.append(vector)
-            return output
+                return legacy
+            return self._good_vectors_from_payload(payload, profile_id)
+
+    def good_vectors(self, profile_id: str) -> list[tuple[float, ...]]:
+        with speaker_lock(self.speakers):
+            self.transaction.recover()
+            return self._good_vectors_from_payload(self._load_payload(), profile_id)
+
+    def status_counts(self, profile_id: str) -> dict[str, int]:
+        counts = {status: 0 for status in EVIDENCE_STATUSES}
+        with speaker_lock(self.speakers):
+            self.transaction.recover()
+            payload = self._load_payload()
+            profile = payload.get("profiles", {}).get(profile_id)
+            records = profile.get("embeddings") if isinstance(profile, dict) else None
+            if not isinstance(records, dict):
+                return counts
+            for record in records.values():
+                if isinstance(record, dict) and record.get("status") in counts:
+                    counts[str(record["status"])] += 1
+        return counts
 
     def prepare_quarantine(self, profiles: Iterable[Any]) -> bytes:
         """Enable strict mode and quarantine every legacy vector lacking replayable evidence."""
@@ -170,9 +227,9 @@ class SpeakerEvidenceStore:
                 key = embedding_key(vector)
                 existing = records.get(key)
                 if isinstance(existing, dict):
-                    # Never downgrade a replayable/manual record.
                     continue
                 records[key] = {
+                    "embedding": list(_normalised_tuple(vector)),
                     "status": "QUARANTINED",
                     "reason": "legacy_without_replayable_audio",
                     "created_at": now,
@@ -210,7 +267,8 @@ class SpeakerEvidenceStore:
             status = str(request.status).upper()
             if status not in EVIDENCE_STATUSES:
                 raise ValueError("Statut de preuve vocale invalide.")
-            key = embedding_key(request.embedding)
+            vector = _normalised_tuple(request.embedding)
+            key = embedding_key(vector)
             profile = payload["profiles"].setdefault(request.profile_id, {
                 "name": "",
                 "model_set_id": "",
@@ -221,6 +279,7 @@ class SpeakerEvidenceStore:
             now = _now()
             record = dict(previous)
             record.update({
+                "embedding": list(vector),
                 "status": status,
                 "updated_at": now,
             })
@@ -230,6 +289,7 @@ class SpeakerEvidenceStore:
                 for field in (
                     "profile_name", "model_set_id", "review_id", "source", "source_name",
                     "historical_name", "link_similarity", "actual_name", "note",
+                    "reassigned_from_profile", "reassigned_from_index",
                 ):
                     if field in request.metadata:
                         value = request.metadata[field]
@@ -250,13 +310,10 @@ class SpeakerEvidenceStore:
                     "audio_sha256": hashlib.sha256(wav).hexdigest(),
                 })
 
-            # Only GOOD evidence can identify a person, and it must remain replayable.
             if status in MATCHABLE_STATUSES:
                 audio_path = self._audio_path(request.profile_id, key)
                 if audio_path not in audio_updates and not audio_path.is_file():
-                    raise ValueError(
-                        "Une empreinte GOOD doit avoir un extrait audio vérifiable."
-                    )
+                    raise ValueError("Une empreinte GOOD doit avoir un extrait audio vérifiable.")
             records[key] = record
 
         return self._encode(payload), audio_updates
@@ -285,7 +342,6 @@ class SpeakerEvidenceStore:
     def materialize_audio(
         self, profile_id: str, vector: Iterable[float], destination: Path,
     ) -> AudioExcerpt | None:
-        """Decrypt one verification clip to a caller-owned temporary WAV for playback."""
         key = embedding_key(vector)
         with speaker_lock(self.speakers):
             self.transaction.recover()

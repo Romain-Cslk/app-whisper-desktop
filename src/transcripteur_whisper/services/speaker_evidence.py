@@ -2,8 +2,8 @@
 
 Profiles keep their biometric vectors in the existing DPAPI store. This sidecar binds a
 stable fingerprint of each vector to a human-review status and, when available, an encrypted
-WAV excerpt that can be replayed later. In strict mode, embeddings without replayable audio
-are quarantined and are never used for automatic identity matching.
+WAV excerpt that can be replayed later. In strict mode, only human-approved GOOD embeddings
+with replayable audio are allowed to participate in automatic identity matching.
 """
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ from .speaker_persistence import SpeakerTransaction, atomic_bytes, speaker_lock
 
 EVIDENCE_SCHEMA_VERSION = 1
 EVIDENCE_STATUSES = {"UNVERIFIED", "GOOD", "BAD", "UNSURE", "QUARANTINED"}
-MATCHABLE_STATUSES = {"UNVERIFIED", "GOOD"}
+MATCHABLE_STATUSES = {"GOOD"}
 
 
 def _now() -> str:
@@ -250,12 +250,12 @@ class SpeakerEvidenceStore:
                     "audio_sha256": hashlib.sha256(wav).hexdigest(),
                 })
 
-            # Matchable evidence must actually be replayable after this transaction.
+            # Only GOOD evidence can identify a person, and it must remain replayable.
             if status in MATCHABLE_STATUSES:
                 audio_path = self._audio_path(request.profile_id, key)
                 if audio_path not in audio_updates and not audio_path.is_file():
                     raise ValueError(
-                        "Une empreinte GOOD/UNVERIFIED doit avoir un extrait audio vérifiable."
+                        "Une empreinte GOOD doit avoir un extrait audio vérifiable."
                     )
             records[key] = record
 
